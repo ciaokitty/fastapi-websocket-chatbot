@@ -101,4 +101,5 @@ To set up this project, follow these steps:
 This setup will allow you to run the application locally and explore its features.
 
 ## Live demo via screencast
+https://github.com/ciaokitty/fastapi-websocket-chatbot/raw/refs/heads/main/demo/demo.mp4
 
