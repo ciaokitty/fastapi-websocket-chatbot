@@ -7,11 +7,16 @@ from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import uuid
+import shutil
 
 from typing import Dict, Set
 import json
 import sys
 import aiofiles
+
+from sqlalchemy.orm import sessionmaker
+from models import engine, Document
+from rag import RAGHandler
 
 MAX_FILE_SIZE = 30 * 1024 * 1024  # 30MB in bytes
 UPLOAD_DIR = Path("uploads")
@@ -39,11 +44,17 @@ class ConnectionManager:
         self.authorized_sessions: Set[str] = set()
 
     async def connect(self, websocket: WebSocket, session_id: str):
+        print(f"Attempting to connect session: {session_id}")  # Debug print
+        print(f"Authorized sessions: {self.authorized_sessions}")  # Debug print
+        
         if session_id not in self.authorized_sessions:
+            print(f"Session {session_id} not authorized")  # Debug print
             await websocket.close(code=1008, reason="Upload documents first")
             return False
+            
         await websocket.accept()
         self.active_connections[session_id] = websocket
+        print(f"Session {session_id} connected successfully")  # Debug print
         return True
 
     async def disconnect(self, session_id: str):
@@ -59,16 +70,42 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Add these near the top with your other global variables
+db_session = sessionmaker(bind=engine)
+rag_handler = RAGHandler()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Clean up uploads directory on startup
+    if UPLOAD_DIR.exists():
+        shutil.rmtree(UPLOAD_DIR)
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    
+    # Clear the database
+    with db_session() as session:
+        session.query(Document).delete()
+        session.commit()
+    
+    yield
+    
+    # Cleanup on shutdown (optional)
+    if UPLOAD_DIR.exists():
+        shutil.rmtree(UPLOAD_DIR)
 
-app = FastAPI()
+# Update FastAPI initialization to use lifespan
+app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost",
     "http://localhost:8080",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
-    "http://localhost:5173"
+    "http://localhost:5173",
+    "http://localhost:8501",
+    # Add WebSocket origins
+    "ws://localhost:8000",
+    "ws://localhost:5173",
+    "*"  # For development only - remove in production
 ]
 
 app.add_middleware(
@@ -77,6 +114,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Add these settings for WebSocket support
+    allow_origin_regex=".*",
+    expose_headers=["*"]
 )
 
 
@@ -164,6 +204,17 @@ async def create_upload_files(
         # Add session_id to the response
         response["session_id"] = session_id
 
+    # After successful upload, save to database
+    with db_session() as session:
+        for file_info in saved_files:
+            doc = Document(
+                id=str(uuid.uuid4()),
+                filename=file_info["original_name"],
+                saved_name=file_info["saved_name"]
+            )
+            session.add(doc)
+        session.commit()
+
     return response
 
 
@@ -182,22 +233,64 @@ async def main():
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    # Attempt to connect (will fail if session is not authorized)
-    is_connected = await manager.connect(websocket, session_id)
-    
-    if not is_connected:
-        return
-
     try:
+        print(f"WebSocket connection attempt from session: {session_id}")
+        is_connected = await manager.connect(websocket, session_id)
+        
+        if not is_connected:
+            print(f"Connection rejected for session: {session_id}")
+            return
+
+        print(f"WebSocket connected for session: {session_id}")
+        
+        # Load documents for this session
+        with db_session() as session:
+            documents = session.query(Document).all()
+            if not documents:
+                print(f"No documents found for session: {session_id}")
+                await manager.send_message("No documents found for this session", session_id)
+                return
+                
+            pdf_paths = [os.path.join(UPLOAD_DIR, doc.saved_name) for doc in documents]
+            print(f"Loading PDFs: {pdf_paths}")
+            
+            try:
+                await rag_handler.load_and_process_pdfs(pdf_paths)
+                await manager.send_message("PDFs loaded successfully. You can now ask questions.", session_id)
+            except Exception as e:
+                print(f"Error loading PDFs: {str(e)}")
+                await manager.send_message(f"Error loading PDFs: {str(e)}", session_id)
+                return
+        
         while True:
-            # Receive question from client
             question = await websocket.receive_text()
-            
-            # For now, return a constant response
-            response = "This is a placeholder response. The actual PDF-based Q&A will be implemented later."
-            
-            # Send response back to client
+            print(f"Received question: {question}")
+            response = await rag_handler.get_answer(question)
+            print(f"Sending response: {response}")
             await manager.send_message(response, session_id)
             
     except WebSocketDisconnect:
+        print(f"WebSocket disconnected for session: {session_id}")
         await manager.disconnect(session_id)
+    except Exception as e:
+        print(f"Error in websocket handler: {str(e)}")
+        print(f"Full error details: {sys.exc_info()}")
+        await manager.disconnect(session_id)
+
+# Add this new endpoint for REST API access
+@app.post("/ask")
+async def ask_question(question: str, session_id: str):
+    if session_id not in manager.authorized_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Upload documents first"
+        )
+    
+    # Load documents if not already loaded
+    with db_session() as session:
+        documents = session.query(Document).all()
+        pdf_paths = [os.path.join(UPLOAD_DIR, doc.saved_name) for doc in documents]
+        rag_handler.load_and_process_pdfs(pdf_paths)
+    
+    response = await rag_handler.get_answer(question)
+    return {"answer": response}
