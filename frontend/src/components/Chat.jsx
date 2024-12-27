@@ -146,7 +146,7 @@ function Chat() {
             <div className="w-full h-full max-w-[1200px] flex flex-col bg-white">
                 {/* Header */}
                 <div className="bg-green-500 p-4 flex justify-between items-center text-white">
-                    <h1 className="text-lg font-bold">PDF Chat Assistant</h1>
+                    <h1 className="text-lg font-bold">ai-planet, formerly DPHi</h1>
                     <div>
                         <input
                             type="file"
